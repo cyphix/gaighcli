@@ -31,8 +31,8 @@ Install the CLI and the agent skill:
 # CLI
 go install github.com/cyphix/gaighcli/cmd/gai-ghcli@latest
 
-# Agent skill (global, all projects)
-npx skills add cyphix/gaighcli --skill gai-ghcli -g
+# Agent skill
+npx skills add cyphix/gaighcli --skill gai-ghcli
 ```
 
 The skill teaches agents to prefer `gai-ghcli` over raw `gh`. It is not a user-facing slash command (`user-invocable: false`) — agents load it when a task touches GitHub. See [skills/gai-ghcli/SKILL.md](skills/gai-ghcli/SKILL.md) for full workflow guidance.
@@ -86,8 +86,7 @@ Installs SessionStart hooks for **Claude Code**, **Codex**, and **Cursor**. Rest
 The installable skill lives at [skills/gai-ghcli/SKILL.md](skills/gai-ghcli/SKILL.md) and is generated from the same CLI constants as `gai-ghcli --help` so command lists never drift.
 
 ```bash
-npx skills add cyphix/gaighcli --skill gai-ghcli -g   # global
-npx skills add cyphix/gaighcli --skill gai-ghcli       # current project
+npx skills add cyphix/gaighcli --skill gai-ghcli
 ```
 
 Regenerate after changing CLI help:
