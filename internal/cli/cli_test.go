@@ -27,6 +27,12 @@ func TestParseRepoContextArgsSearchKeepsRepo(t *testing.T) {
 	}
 }
 
+func TestTopHelpIncludesProjectExamples(t *testing.T) {
+	if !strings.Contains(TopHelp, "gai-ghcli project list") {
+		t.Fatalf("TopHelp missing project examples")
+	}
+}
+
 func TestGetCommandHelp(t *testing.T) {
 	help, ok := GetCommandHelp("issue")
 	if !ok || !strings.Contains(help, "gai-ghcli issue") {

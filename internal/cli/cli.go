@@ -26,6 +26,8 @@ examples:
   gai-ghcli issue list -R owner/name
   gai-ghcli issue list --repo=owner/name
   gai-ghcli pr view 42
+  gai-ghcli project list
+  gai-ghcli project item-add 1 --url https://github.com/owner/repo/issues/42
   gai-ghcli secret list
   gai-ghcli setup hooks
 `
