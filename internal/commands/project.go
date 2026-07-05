@@ -1,6 +1,11 @@
 package commands
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -15,10 +20,10 @@ import (
 )
 
 const ProjectHelp = `usage: gai-ghcli project <subcommand> [flags]
-subcommands[19]:
+subcommands[20]:
   list, view <number>, create, edit <number>, close <number>, delete <number>, copy <number>,
   mark-template <number>, link <number>, unlink <number>,
-  item-list <number>, item-add <number>, item-create <number>, item-edit, item-delete <number>, item-archive <number>,
+  item-list <number>, item-add <number>, item-create <number>, item-edit, item-set-status <number>, item-delete <number>, item-archive <number>,
   field-list <number>, field-create <number>, field-delete
 flags{common}:
   --owner <login> (default: current repo owner or @me)
@@ -46,6 +51,9 @@ flags{item-create}:
   --title <text> (required), --body <text> or --body-file <path>
 flags{item-edit}:
   --id <item-id> (required), --project-id, --field-id, --text, --number, --date, --single-select-option-id, --iteration-id, --clear, --body
+flags{item-set-status}:
+  --issue <n> (required unless --title set), --title <text> (required unless --issue set), --status <name> (required, case-sensitive),
+  --owner, --repo, --status-field (default Status), --config, --limit <n> (default 500)
 flags{item-delete,item-archive}:
   --id <item-id> (required), --undo (item-archive only)
 flags{field-list}:
@@ -60,6 +68,8 @@ examples:
   gai-ghcli project create --title "Roadmap" --owner myorg
   gai-ghcli project item-list 1 --query "status:Ready"
   gai-ghcli project item-add 1 --url https://github.com/owner/repo/issues/42
+  gai-ghcli project item-set-status 3 --issue 42 --status Ready
+  gai-ghcli project item-set-status 3 --title "Fix login bug" --status "In progress"
   gai-ghcli project link 1 --repo owner/repo
 notes:
   Requires gh token scope "project" — run gh auth refresh -s project if auth fails`
@@ -849,6 +859,448 @@ func deleteProjectField(a []string, ctx *context.RepoContext) (string, error) {
 	}, ctx)
 }
 
+type issueBoardConfig struct {
+	ProjectNumber int               `json:"projectNumber"`
+	ProjectID     string            `json:"projectId"`
+	StatusFieldID string            `json:"statusFieldId"`
+	StatusOptions map[string]string `json:"statusOptions"`
+}
+
+func gitRoot() string {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func resolveIssueBoardConfigPath(work []string) string {
+	if path := args.GetFlag(work, "--config"); path != "" {
+		return path
+	}
+	root := gitRoot()
+	if root == "" {
+		return ""
+	}
+	candidate := filepath.Join(root, ".github", "issue-board.json")
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return ""
+}
+
+func loadIssueBoardConfig(path string) (*issueBoardConfig, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, errors.NewGoAIError("Failed to read config: "+path, "VALIDATION_ERROR")
+	}
+	var cfg issueBoardConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, errors.NewGoAIError("Invalid issue-board config JSON: "+err.Error(), "VALIDATION_ERROR")
+	}
+	return &cfg, nil
+}
+
+func validateIssueBoardConfig(cfg *issueBoardConfig, projectNum int) error {
+	if cfg == nil || cfg.ProjectNumber == 0 {
+		return nil
+	}
+	if cfg.ProjectNumber != projectNum {
+		return errors.NewGoAIError(
+			fmt.Sprintf("config projectNumber %d does not match argument %d", cfg.ProjectNumber, projectNum),
+			"VALIDATION_ERROR",
+		)
+	}
+	return nil
+}
+
+func resolveIssueBoardOwner(work []string, ctx *context.RepoContext) string {
+	if o := args.GetFlag(work, "--owner"); o != "" {
+		return o
+	}
+	if o := os.Getenv("ISSUE_BOARD_OWNER"); o != "" {
+		return o
+	}
+	return resolveProjectOwner(work, ctx)
+}
+
+func projectContentNumberValue(item map[string]any) (int, bool) {
+	content, _ := item["content"].(map[string]any)
+	if content == nil {
+		return 0, false
+	}
+	switch n := content["number"].(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	}
+	return 0, false
+}
+
+func itemMatchesRepo(item map[string]any, repo string) bool {
+	if repo == "" {
+		return true
+	}
+	content, _ := item["content"].(map[string]any)
+	if content == nil {
+		return false
+	}
+	if r, ok := content["repository"].(string); ok && r != "" {
+		return r == repo
+	}
+	if url, ok := content["url"].(string); ok {
+		if n, ok := projectContentNumberValue(item); ok {
+			if strings.HasSuffix(url, fmt.Sprintf("/issues/%d", n)) ||
+				strings.HasSuffix(url, fmt.Sprintf("/pull/%d", n)) {
+				return strings.Contains(url, "/"+repo+"/")
+			}
+		}
+	}
+	return false
+}
+
+func findProjectItemByIssue(items []map[string]any, issueNum int, repo string) (map[string]any, bool) {
+	for _, item := range items {
+		n, ok := projectContentNumberValue(item)
+		if !ok || n != issueNum {
+			continue
+		}
+		if itemMatchesRepo(item, repo) {
+			return item, true
+		}
+	}
+	return nil, false
+}
+
+func findProjectItemByTitle(items []map[string]any, title, repo string) (map[string]any, []map[string]any, bool) {
+	want := strings.TrimSpace(title)
+	var matches []map[string]any
+	for _, item := range items {
+		if !itemMatchesRepo(item, repo) {
+			continue
+		}
+		itemTitle, _ := item["title"].(string)
+		if strings.EqualFold(strings.TrimSpace(itemTitle), want) {
+			matches = append(matches, item)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, nil, false
+	case 1:
+		return matches[0], nil, true
+	default:
+		return nil, matches, false
+	}
+}
+
+func projectItemTitle(item map[string]any) string {
+	title, _ := item["title"].(string)
+	return strings.TrimSpace(title)
+}
+
+func fetchProjectItems(projectNum int, owner, limit string) ([]map[string]any, error) {
+	resp, err := gh.JSON[struct {
+		Items []map[string]any `json:"items"`
+	}](Runner, appendOwnerFlag([]string{
+		"project", "item-list", strconv.Itoa(projectNum), "--format", "json", "--limit", limit,
+	}, owner), nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Items, nil
+}
+
+func resolveProjectIDFromGH(projectNum int, owner string) (string, error) {
+	item, err := gh.JSON[map[string]any](Runner, appendOwnerFlag([]string{
+		"project", "view", strconv.Itoa(projectNum), "--format", "json",
+	}, owner), nil)
+	if err != nil {
+		return "", err
+	}
+	id, _ := item["id"].(string)
+	if id == "" {
+		return "", errors.NewGoAIError("Unable to resolve project ID", "UNKNOWN")
+	}
+	return id, nil
+}
+
+type statusFieldResolution struct {
+	FieldID   string
+	OptionID  string
+	OptionNames []string
+}
+
+func resolveStatusField(projectNum int, owner, statusField, statusName string, cfg *issueBoardConfig) (statusFieldResolution, error) {
+	var res statusFieldResolution
+
+	if cfg != nil {
+		if cfg.ProjectID != "" {
+			// project ID resolved separately
+		}
+		if cfg.StatusFieldID != "" {
+			res.FieldID = cfg.StatusFieldID
+		}
+		if cfg.StatusOptions != nil {
+			if optID, ok := cfg.StatusOptions[statusName]; ok && optID != "" {
+				res.OptionID = optID
+			}
+		}
+	}
+
+	if res.FieldID != "" && res.OptionID != "" {
+		return res, nil
+	}
+
+	resp, err := gh.JSON[struct {
+		Fields []map[string]any `json:"fields"`
+	}](Runner, appendOwnerFlag([]string{
+		"project", "field-list", strconv.Itoa(projectNum), "--format", "json", "--limit", "100",
+	}, owner), nil)
+	if err != nil {
+		return res, err
+	}
+
+	for _, field := range resp.Fields {
+		name, _ := field["name"].(string)
+		if name != statusField {
+			continue
+		}
+		if res.FieldID == "" {
+			res.FieldID, _ = field["id"].(string)
+		}
+		opts, _ := field["options"].([]any)
+		for _, o := range opts {
+			m, _ := o.(map[string]any)
+			optName, _ := m["name"].(string)
+			res.OptionNames = append(res.OptionNames, optName)
+			if optName == statusName {
+				if id, ok := m["id"].(string); ok {
+					res.OptionID = id
+				}
+			}
+		}
+		break
+	}
+
+	if res.FieldID == "" {
+		return res, errors.NewGoAIError(
+			fmt.Sprintf("Status field %q not found on project %d", statusField, projectNum),
+			"NOT_FOUND",
+			fmt.Sprintf("Run `gai-ghcli project field-list %d` to see fields", projectNum),
+		)
+	}
+
+	if res.OptionID == "" && cfg != nil && cfg.StatusOptions != nil {
+		if optID, ok := cfg.StatusOptions[statusName]; ok && optID != "" {
+			for _, field := range resp.Fields {
+				name, _ := field["name"].(string)
+				if name != statusField {
+					continue
+				}
+				opts, _ := field["options"].([]any)
+				for _, o := range opts {
+					m, _ := o.(map[string]any)
+					id, _ := m["id"].(string)
+					if id == optID || strings.HasSuffix(id, optID) {
+						res.OptionID = id
+						break
+					}
+				}
+				break
+			}
+			if res.OptionID == "" {
+				res.OptionID = optID
+			}
+		}
+	}
+
+	if res.OptionID == "" {
+		msg := fmt.Sprintf("Unknown status %q for field %s", statusName, statusField)
+		if len(res.OptionNames) > 0 {
+			return res, errors.NewGoAIError(
+				msg+": available "+strings.Join(res.OptionNames, ", "),
+				"VALIDATION_ERROR",
+			)
+		}
+		return res, errors.NewGoAIError(msg, "VALIDATION_ERROR")
+	}
+
+	return res, nil
+}
+
+func renderItemSetStatusResult(repo, targetStatus, previousStatus string, item map[string]any, changed bool) map[string]any {
+	fields := map[string]any{
+		"repo":           repo,
+		"previousStatus": previousStatus,
+		"status":         targetStatus,
+	}
+	if n, ok := projectContentNumberValue(item); ok {
+		fields["issue"] = n
+	}
+	if title := projectItemTitle(item); title != "" {
+		fields["title"] = title
+	}
+	if changed {
+		fields["changed"] = "yes"
+	} else {
+		fields["changed"] = "no"
+	}
+	return fields
+}
+
+func renderItemSetStatusOutput(projectNum int, fields map[string]any, ctx *context.RepoContext) (string, error) {
+	enc, err := encode(fields)
+	if err != nil {
+		return "", err
+	}
+	return renderWithHelp([]string{enc}, suggestions.Context{
+		Domain: "project", Action: "item-set-status", ID: strconv.Itoa(projectNum), Repo: ctx,
+	})
+}
+
+func setProjectItemStatus(a []string, ctx *context.RepoContext) (string, error) {
+	num, err := requireProjectNumber(a, 1)
+	if err != nil {
+		return "", err
+	}
+	work := append([]string{}, a[2:]...)
+
+	issueRaw := args.GetFlag(work, "--issue")
+	titleRaw := args.GetFlag(work, "--title")
+	targetStatus := args.GetFlag(work, "--status")
+
+	switch {
+	case issueRaw == "" && titleRaw == "":
+		return "", errors.NewGoAIError("--issue or --title is required", "VALIDATION_ERROR")
+	case issueRaw != "" && titleRaw != "":
+		return "", errors.NewGoAIError("Use --issue or --title, not both", "VALIDATION_ERROR")
+	case targetStatus == "":
+		return "", errors.NewGoAIError("--status is required", "VALIDATION_ERROR")
+	}
+
+	var issueNum int
+	if issueRaw != "" {
+		issueNum, err = args.RequireNumber(issueRaw, "issue")
+		if err != nil {
+			return "", err
+		}
+	}
+
+	repo := resolveLinkRepo(work, ctx)
+	if repo == "" {
+		return "", errors.NewGoAIError("--repo is required (or run from a git repo)", "VALIDATION_ERROR")
+	}
+
+	owner := resolveIssueBoardOwner(work, ctx)
+	statusField := args.GetFlag(work, "--status-field")
+	if statusField == "" {
+		statusField = "Status"
+	}
+	limit := args.GetFlag(work, "--limit")
+	if limit == "" {
+		limit = "500"
+	}
+
+	configPath := resolveIssueBoardConfigPath(work)
+	cfg, err := loadIssueBoardConfig(configPath)
+	if err != nil {
+		return "", err
+	}
+	if err := validateIssueBoardConfig(cfg, num); err != nil {
+		return "", err
+	}
+
+	items, err := fetchProjectItems(num, owner, limit)
+	if err != nil {
+		return "", err
+	}
+
+	var item map[string]any
+	if issueRaw != "" {
+		var found bool
+		item, found = findProjectItemByIssue(items, issueNum, repo)
+		if !found {
+			return "", errors.NewGoAIError(
+				fmt.Sprintf("Issue #%d not found on project %d", issueNum, num),
+				"NOT_FOUND",
+				fmt.Sprintf("gai-ghcli project item-add %d --url https://github.com/%s/issues/%d", num, repo, issueNum),
+			)
+		}
+	} else {
+		var ambiguous []map[string]any
+		var found bool
+		item, ambiguous, found = findProjectItemByTitle(items, titleRaw, repo)
+		if !found {
+			if len(ambiguous) > 0 {
+				var parts []string
+				for _, m := range ambiguous {
+					n, _ := projectContentNumberValue(m)
+					parts = append(parts, fmt.Sprintf("#%d %q", n, projectItemTitle(m)))
+				}
+				return "", errors.NewGoAIError(
+					fmt.Sprintf("Multiple items match title %q: %s", titleRaw, strings.Join(parts, ", ")),
+					"AMBIGUOUS_MATCH",
+					"Re-run with --issue <n>",
+				)
+			}
+			return "", errors.NewGoAIError(
+				fmt.Sprintf("No project item titled %q in %s on project %d", titleRaw, repo, num),
+				"NOT_FOUND",
+				fmt.Sprintf("gai-ghcli project item-list %d", num),
+			)
+		}
+	}
+
+	itemID, _ := item["id"].(string)
+	if itemID == "" {
+		return "", errors.NewGoAIError("Matched project item has no ID", "UNKNOWN")
+	}
+
+	previousStatus, _ := item["status"].(string)
+	if previousStatus == targetStatus {
+		return renderItemSetStatusOutput(num,
+			renderItemSetStatusResult(repo, targetStatus, previousStatus, item, false), ctx)
+	}
+
+	projectID := ""
+	if cfg != nil {
+		projectID = cfg.ProjectID
+	}
+	if projectID == "" {
+		projectID, err = resolveProjectIDFromGH(num, owner)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	fieldRes, err := resolveStatusField(num, owner, statusField, targetStatus, cfg)
+	if err != nil {
+		return "", err
+	}
+
+	_, err = gh.JSON[map[string]any](Runner, []string{
+		"project", "item-edit", "--format", "json",
+		"--id", itemID,
+		"--project-id", projectID,
+		"--field-id", fieldRes.FieldID,
+		"--single-select-option-id", fieldRes.OptionID,
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return renderItemSetStatusOutput(num,
+		renderItemSetStatusResult(repo, targetStatus, previousStatus, item, true), ctx)
+}
+
 // Project handles project subcommands.
 func Project(a []string, ctx *context.RepoContext) (string, error) {
 	sub := ""
@@ -893,6 +1345,8 @@ func Project(a []string, ctx *context.RepoContext) (string, error) {
 		return createProjectItem(a, ctx)
 	case "item-edit":
 		return editProjectItem(a, ctx)
+	case "item-set-status":
+		return setProjectItemStatus(a, ctx)
 	case "item-delete":
 		return deleteProjectItem(a, ctx)
 	case "item-archive":

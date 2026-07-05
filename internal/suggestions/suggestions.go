@@ -513,6 +513,15 @@ var table = []entry{
 		useCtx: true,
 	},
 	{
+		match: func(ctx Context) bool { return ctx.Domain == "project" && ctx.Action == "item-set-status" },
+		templates: []string{
+			"gai-ghcli project item-list ${c.id}",
+			"gai-ghcli project item-set-status ${c.id} --issue <n> --status <name>",
+			"gai-ghcli project item-set-status ${c.id} --title \"<issue title>\" --status <name>",
+		},
+		useCtx: true,
+	},
+	{
 		match: func(ctx Context) bool { return ctx.Domain == "project" && ctx.Action == "field-list" },
 		templates: []string{
 			"gai-ghcli project item-list ${c.id}",

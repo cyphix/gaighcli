@@ -122,6 +122,7 @@ Run `+"`gai-ghcli --help`"+` for global flags, or `+"`gai-ghcli <command> --help
 - Use `+"`api`"+` for anything the dedicated commands do not cover, e.g. `+"`gai-ghcli api repos/{owner}/{repo}/topics`"+`.
 - GitHub Projects require the `+"`project`"+` token scope: `+"`gh auth refresh -s project`"+`.
 - Add an issue to a project board: `+"`gai-ghcli project item-add <n> --url https://github.com/owner/repo/issues/<num>`"+`.
+- Set project board status by number or title: `+"`gai-ghcli project item-set-status <n> --issue <num> --status Ready`"+` or `+"`--title \"<issue title>\" --status Ready`"+` (agents must not assemble node IDs).
 - Filter project items: `+"`gai-ghcli project item-list <n> --query \"status:Ready assignee:@me\"`"+`.
 `,
 		yamlDoubleQuote(SkillDescription),
